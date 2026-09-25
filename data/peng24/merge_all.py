@@ -32,7 +32,7 @@ if CALLER_BLACKLIST:
     print(f"blacklist excluded {n_before - annot.height} row(s) for callers={CALLER_BLACKLIST}")
 
 # %%
-in_vcf_root = data_root / dataset / "vcf_reannotated"
+in_vcf_root = data_root / dataset / "vcf_fixed"
 svcf_root   = data_root / dataset / "svcf_all"
 merged_root = data_root / dataset / "merged_all"
 svcf_root.mkdir(parents=True, exist_ok=True)
