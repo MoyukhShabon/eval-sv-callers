@@ -9,7 +9,7 @@ logger = logging.getLogger("svcf2matrix")
 project_root = Path("../..").resolve()
 
 ## Manifest column used to name matrix columns
-LEVEL_COLS = {"platform": "platform", "file": "name"}
+LEVEL_COLS = {"platform": "platform", "caller": "caller", "file": "name"}
 
 ## Locus description carried into the matrix. Row identity is sv_idx (one row per merged record),
 ## so records that happen to share these values are never collapsed together.
@@ -127,7 +127,7 @@ def read_svcf(
 
 # %%
 def read_manifest(path: Path) -> pl.DataFrame:
-	m = pl.read_csv(path, separator="\t", schema_overrides={"split": pl.Utf8})
+	m = pl.read_csv(path, separator="\t", schema_overrides={"split": pl.Utf8, "replicate": pl.Utf8})
 	missing = {"label", "kind", "platform", "name", "split"} - set(m.columns)
 	if missing:
 		raise ValueError(f"{path.name}: manifest missing columns {missing}")
@@ -159,9 +159,21 @@ def svcf2matrix(
 	manifest = read_manifest(manifest_path).with_columns(
 		pl.col(group_col).str.to_lowercase().alias("column")
 	)
+	if group_col not in manifest.columns:
+		raise ValueError(f"manifest has no '{group_col}' column (re-run the merge script)")
 	n_groups = manifest.select(group_col).n_unique()
 	if manifest.select("column").n_unique() != n_groups:
 		raise ValueError(f"'{group_col}' values collide after lowercasing")
+	ambiguous = (
+		manifest.filter(pl.col("kind") == "call")
+		.group_by("column").agg(pl.col("platform").n_unique().alias("n"))
+		.filter(pl.col("n") > 1)
+	)
+	if ambiguous.height:
+		raise ValueError(
+			f"level='{level}' columns span several platforms: {ambiguous['column'].to_list()}. "
+			"Use level='caller' only on intra-platform merges, or level='file'."
+		)
 
 	svcf = (
 		read_svcf(svcf_path, standard_contigs=standard_contigs, sort=False)
@@ -270,3 +282,23 @@ matrix_consensus.write_parquet(
 ## Optional: same rule, one column per caller file, from the same merge
 # matrix_file = svcf2matrix(svcf_path, manifest_path, level="file")
 # matrix_file.write_parquet(matrix_outdir / "files.matrix.parquet", compression="snappy")
+
+
+# %% [markdown]
+# ## Intra-platform (caller-level) matrices
+
+# # %%
+# platform_index = pl.read_csv(data_root / "intra-platform_merge" / "index.tsv", separator="\t")
+# intra_outdir = matrix_outdir / "intra-platform"
+# intra_outdir.mkdir(exist_ok=True, parents=True)
+
+# for rec in platform_index.iter_rows(named=True):
+# 	logger.info(f"== {rec['platform']} ({rec['callers']})")
+# 	for level in ("caller", "file"):
+# 		m = svcf2matrix(Path(rec["svcf"]), Path(rec["manifest"]), level=level,
+# 		                standard_contigs=True, sort=True)
+# 		m.write_parquet(intra_outdir / f"{rec['slug']}.{level}.matrix.parquet", compression="snappy")
+# 		m.filter(pl.col("seqc2_consensus_svs")).write_parquet(
+# 			intra_outdir / f"{rec['slug']}.{level}.seqc_consensus_validated.matrix.parquet",
+# 			compression="snappy",
+# 		)
