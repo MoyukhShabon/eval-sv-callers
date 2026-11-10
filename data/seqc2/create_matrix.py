@@ -232,16 +232,22 @@ def svcf2matrix(
 		.select("sv_idx", *ID_COLS, "called_by_platform", *col_order)
 	)
 
-	n_truth_only = matrix.filter(~pl.col("called_by_platform")).height
-	if keep_truth_only:
-		logger.info(f"Keeping {n_truth_only} truth-only records (no platform call)")
-	else:
-		matrix = matrix.filter(pl.col("called_by_platform"))
-		logger.info(f"Dropped {n_truth_only} truth-only records")
-
-	n_dup = matrix.select([c for c in ID_COLS if c != "id"]).is_duplicated().sum()
-	if n_dup:
-		logger.warning(f"{n_dup} rows share identical locus fields; kept as separate records (distinct sv_idx)")
+	## Collapse rows at an identical locus. OctopuSV leaves these split when ALT differs
+	## (TRA: truth '++' placeholder vs caller bracket orientation) or SVLEN is missing
+	## (Bionano INV replicates). svlen stays in the key so different-size INS/DEL never merge.
+	COLLAPSE_KEY = ["chrom", "pos", "end", "chr2", "svtype", "svlen"]
+	n_before = matrix.height
+	matrix = (
+		matrix.group_by(COLLAPSE_KEY, maintain_order=True)
+		.agg(
+			pl.col("sv_idx").min(),
+			pl.col("ref", "alt", "id").first(),
+			pl.len().alias("n_collapsed"),
+			pl.col("called_by_platform", *col_order).any(),
+		)
+		.select("sv_idx", *ID_COLS, "n_collapsed", "called_by_platform", *col_order)
+	)
+	logger.info(f"Collapsed {n_before - matrix.height} same-locus rows (TRA orientation / INV SVLEN splits)")
 
 	logger.info(
 		f"{matrix.height} records; True counts:\n"
@@ -276,7 +282,7 @@ matrix.write_parquet(matrix_outdir / "platforms.matrix.parquet", compression="sn
 
 matrix_consensus = matrix.filter(pl.col("seqc2_consensus_svs"))
 matrix_consensus.write_parquet(
-	matrix_outdir / "platforms.seqc_consensus_validated.matrix.parquet", compression="snappy"
+	matrix_outdir / "platforms.seqc2_consensus_validated.matrix.parquet", compression="snappy"
 )
 
 ## Optional: same rule, one column per caller file, from the same merge
