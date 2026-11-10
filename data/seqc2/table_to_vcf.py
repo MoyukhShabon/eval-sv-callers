@@ -127,6 +127,9 @@ def build_records(row, fasta):
     if strands not in VALID_STRANDS:
         strands = None
 
+    if svtype in {"TRA", "BND"} and chrom1 == chrom2 and strands in (None, "++"):
+        raise ValueError(f"intra-chrom {svtype} with unknown orientation: {sv_id}")
+
     # ---- breakends (translocations / any inter-chromosomal event)
     if svtype in {"TRA", "BND"} or chrom1 != chrom2:
         if strands is None:
