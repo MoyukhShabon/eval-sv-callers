@@ -1,12 +1,19 @@
 # %%
+import logging
 import polars as pl
 from pathlib import Path
-from tqdm import tqdm
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", force=True)
+logger = logging.getLogger("svcf2matrix")
 
 project_root = Path("../..").resolve()
 
-# %% [markdown]
-# ## Functions
+## Manifest column used to name matrix columns
+LEVEL_COLS = {"platform": "platform", "file": "name"}
+
+## Locus description carried into the matrix. Row identity is sv_idx (one row per merged record),
+## so records that happen to share these values are never collapsed together.
+ID_COLS = ["chrom", "pos", "end", "chr2", "ref", "alt", "svtype", "svlen", "id"]
 
 # %%
 def select_standard_contigs(
@@ -79,7 +86,12 @@ def human_sort_contigs(
 	return df.sort(by=by_list, descending=desc_list)
 
 # %%
-def read_svcf(svcf_path: Path, standard_contigs: bool = False, sort: bool = True, columns: list = ["#CHROM", "POS", "REF", "ALT", "INFO"]) -> pl.DataFrame:
+def read_svcf(
+	svcf_path: Path,
+	standard_contigs: bool = False,
+	sort: bool = True,
+	columns: list = ["#CHROM", "POS", "ID", "REF", "ALT", "INFO"],
+) -> pl.DataFrame:
 	svcf = (
 		pl.read_csv(
 			svcf_path,
@@ -95,15 +107,17 @@ def read_svcf(svcf_path: Path, standard_contigs: bool = False, sort: bool = True
 	if standard_contigs:
 		svcf = select_standard_contigs(svcf, chrom_col="chrom")
 
+	## (^|;) anchors stop END= from matching CIEND= / SVEND= etc.
+	def info(key: str) -> pl.Expr:
+		return pl.col("info").str.extract(rf"(?:^|;){key}=([^;]+)")
 
-	# --- pull end, svtype, svlen, sources, and source_ids out of the info string ---
 	svcf = svcf.with_columns(
 		pl.col("ref").fill_null("N"),
-		pl.col("info").str.extract(r"END=([^;]+)").cast(pl.Int64).alias("end"),
-		pl.col("info").str.extract(r"SVLEN=([^;]+)").replace(".", None).cast(pl.Int64).alias("svlen"),
-		pl.col("info").str.extract(r"SVTYPE=([^;]+)").alias("svtype"),
-		pl.col("info").str.extract(r"SOURCES=([^;]+)").alias("source"),
-		# pl.col("info").str.extract(r"SOURCE_IDS=([^;]+)").alias("source_id"),
+		info("END").cast(pl.Int64, strict=False).alias("end"),
+		info("SVLEN").cast(pl.Int64, strict=False).alias("svlen"),   # "." -> null
+		info("SVTYPE").alias("svtype"),
+		info("CHR2").alias("chr2"),
+		info("SOURCES").alias("source"),
 	)
 
 	if sort:
@@ -112,78 +126,115 @@ def read_svcf(svcf_path: Path, standard_contigs: bool = False, sort: bool = True
 	return svcf
 
 # %%
-def annotate_svcf(svcf: pl.DataFrame, presence_value: bool = True) -> pl.DataFrame:
-    ## SOURCES label pattern: {platform}.{type}.{filter}
-    # label_pattern = r"^(?<platform>[^.]+)\."
-
-    return (
-        svcf
-        .with_columns(pl.col("source").str.split(","))
-        .explode("source")
-        .with_columns(pl.col("source").str.split(".").list.get(0).str.to_lowercase())
-        .with_columns(pl.lit(presence_value).alias("present"))
-    )
+def read_manifest(path: Path) -> pl.DataFrame:
+	m = pl.read_csv(path, separator="\t", schema_overrides={"split": pl.Utf8})
+	missing = {"label", "kind", "platform", "name", "split"} - set(m.columns)
+	if missing:
+		raise ValueError(f"{path.name}: manifest missing columns {missing}")
+	if m["label"].is_duplicated().any():
+		raise ValueError(f"{path.name}: duplicate labels")
+	return m
 
 # %%
 def svcf2matrix(
-	svcf_pass_path: Path, 
-	svcf_all_path: Path,
+	svcf_path: Path,
+	manifest_path: Path,
+	level: str = "platform",          # "platform" | "file"
 	standard_contigs: bool = True,
 	sort: bool = True,
+	keep_truth_only: bool = True,
 ) -> pl.DataFrame:
+	"""
+	One row per merged record. Each platform (or file) column is True only if that
+	platform contributed a PASS call to the record; a non-PASS call and no call are both
+	False. Truth-set columns are True when the truth set supports the record.
 
-	if svcf_pass_path.stem.split(".")[0] != svcf_all_path.stem.split(".")[0]:
-		raise ValueError (
-			"Provided svcf_pass_path and svcf_all_path stems don't match. "
-			f"svcf_pass_path.stem = {svcf_pass_path.stem}\n"
-			f"svcf_all_path.stem = {svcf_all_path.stem}\n"
-		)
+	keep_truth_only: keep records supported only by truth sets (no platform call at all).
+	These are platform false negatives and are needed to compute recall against the truth.
+	"""
+	if level not in LEVEL_COLS:
+		raise ValueError(f"level must be one of {list(LEVEL_COLS)}")
+	group_col = LEVEL_COLS[level]
 
-	svcf_pass = read_svcf(svcf_pass_path, standard_contigs=standard_contigs, sort=sort)
-	svcf_all = read_svcf(svcf_all_path, standard_contigs=standard_contigs, sort=sort)
-
-	# SVs which only appear in the merge without pass filtering
-	non_pass_svs = svcf_all.join(svcf_pass, on = ["chrom", "pos", "ref", "alt", "svtype"], how="anti", nulls_equal=True)
-	
-	if not svcf_all.height == (svcf_pass.height + non_pass_svs.height):
-		print("Warning: Non-PASS SVs + PASS SVs don't add up to all-SVs")
-	
-	# return svcf_all, svcf_pass, non_pass_svs
-	del svcf_all
-
-	svcf_annotated = pl.concat([
-		svcf_pass.pipe(annotate_svcf, presence_value=True), 
-		non_pass_svs.pipe(annotate_svcf, presence_value=False)
-	])
-	del svcf_pass, non_pass_svs
-
-	# Pivot to wide boolean matrix
-	# The IDs defines locus identity for the matrix; columns omitted here gets silently dropped by the pivot
-	id_cols = ["chrom", "pos", "end", "ref", "alt", "svtype", "svlen"]
-
-	## Check if there are multiple values contributing towards presence in a single caller' locus.
-	collisions = (
-		svcf_annotated.group_by(id_cols + ["source"])
-		.len()
-		.filter(pl.col("len") > 1)
+	manifest = read_manifest(manifest_path).with_columns(
+		pl.col(group_col).str.to_lowercase().alias("column")
 	)
-	if collisions.height:
-		print(
-			f"WARNING: {collisions.height} (ids + caller) groups in {svcf_pass_path.stem} had multiple contributing" 
-			"source rows. Pivot's aggregate_function will collapse these into 1 boolean label (via OR union) as a safety net"
+	n_groups = manifest.select(group_col).n_unique()
+	if manifest.select("column").n_unique() != n_groups:
+		raise ValueError(f"'{group_col}' values collide after lowercasing")
+
+	svcf = (
+		read_svcf(svcf_path, standard_contigs=standard_contigs, sort=False)
+		.with_row_index("sv_idx")
+	)
+	if (n := svcf["source"].null_count()):
+		raise ValueError(f"{n} records in {svcf_path.name} have no INFO/SOURCES")
+
+	## Long format: one row per (record, contributing label)
+	long = (
+		svcf.select("sv_idx", pl.col("source").str.split(",").alias("label"))
+		.explode("label")
+		.join(manifest, on="label", how="left")
+	)
+	unknown = long.filter(pl.col("kind").is_null())["label"].unique().to_list()
+	if unknown:
+		raise ValueError(
+			f"SOURCES labels not in manifest (stale manifest, or OctopuSV rewrote labels): {unknown[:10]}"
 		)
 
-	# Caller columns are boolean indicating a call (TRUE) only if their FILTER was PASS, else FALSE
-	matrix = svcf_annotated.pivot(
-		values="present",
-		index=id_cols,
-		on="source",
+	long = long.with_columns(
+		((pl.col("kind") == "truth") | pl.col("split").eq("pass").fill_null(False)).alias("present")
+	)
+
+	## Diagnostics
+	per_cell = (
+		long.filter(pl.col("kind") == "call")
+		.group_by("sv_idx", "column")
+		.agg(pl.col("present").any().alias("any_pass"), pl.col("present").all().alias("all_pass"))
+	)
+	n_mixed = per_cell.filter(pl.col("any_pass") & ~pl.col("all_pass")).height
+	if n_mixed:
+		logger.info(
+			f"{n_mixed} (record, {level}) cells have both PASS and non-PASS support -> True (any PASS wins)"
+		)
+
+	called = long.group_by("sv_idx").agg(
+		(pl.col("kind") == "call").any().alias("called_by_platform")
+	)
+
+	## Wide boolean matrix; any() ORs multiple labels landing on the same column
+	wide = long.pivot(
+		on="column", index="sv_idx", values="present",
 		aggregate_function=pl.element().any(),
 	)
 
-	# Fill Null caller columns with False
-	source_cols = [c for c in matrix.columns if c not in id_cols]
-	matrix = matrix.with_columns([pl.col(c).fill_null(False) for c in source_cols])
+	## Platforms first, then truth sets, in manifest order; add all-False columns for absent groups
+	col_order = manifest["column"].unique(maintain_order=True).to_list()
+	wide = wide.with_columns([pl.lit(False).alias(c) for c in col_order if c not in wide.columns])
+
+	matrix = (
+		svcf.select("sv_idx", *ID_COLS)
+		.join(called, on="sv_idx", how="left")
+		.join(wide, on="sv_idx", how="left")
+		.with_columns(pl.col(col_order).fill_null(False))
+		.select("sv_idx", *ID_COLS, "called_by_platform", *col_order)
+	)
+
+	n_truth_only = matrix.filter(~pl.col("called_by_platform")).height
+	if keep_truth_only:
+		logger.info(f"Keeping {n_truth_only} truth-only records (no platform call)")
+	else:
+		matrix = matrix.filter(pl.col("called_by_platform"))
+		logger.info(f"Dropped {n_truth_only} truth-only records")
+
+	n_dup = matrix.select([c for c in ID_COLS if c != "id"]).is_duplicated().sum()
+	if n_dup:
+		logger.warning(f"{n_dup} rows share identical locus fields; kept as separate records (distinct sv_idx)")
+
+	logger.info(
+		f"{matrix.height} records; True counts:\n"
+		+ str(matrix.select(pl.col(col_order).sum()))
+	)
 
 	if sort:
 		matrix = human_sort_contigs(matrix, by=["chrom", "pos"], chrom_col="chrom")
@@ -195,26 +246,27 @@ def svcf2matrix(
 
 # %%
 dataset = "seqc2"
-annot_root = project_root / "annot" / dataset
 data_root = project_root / "data" / dataset
 
 matrix_outdir = data_root / "matrix"
 matrix_outdir.mkdir(exist_ok=True, parents=True)
 
-# octopusv union merge svcfs with only PASS SV
-svcf_pass_paths = data_root / "platforms.merged.pass.svcf"
-
-# octopusv union merge svcfs with all SVs (retains non-PASS SVs)
-svcf_all_paths = data_root / "platforms.merged.all.svcf"
+## Single flat OctopuSV union merge: every caller file x {pass, nonpass} + truth sets
+svcf_path = data_root / "platforms.merged.split.svcf"
+manifest_path = data_root / "platforms.merged.split.sources.tsv"
 
 # %% [markdown]
 # ## Main
 
 # %%
-matrix = svcf2matrix(svcf_pass_path= svcf_pass_paths, svcf_all_path=svcf_all_paths, standard_contigs=True, sort=True)
-matrix.write_parquet(matrix_outdir / f"platforms.matrix.parquet",  compression="snappy")
+matrix = svcf2matrix(svcf_path, manifest_path, level="platform", standard_contigs=True, sort=True)
+matrix.write_parquet(matrix_outdir / "platforms.matrix.parquet", compression="snappy")
 
 matrix_consensus = matrix.filter(pl.col("seqc2_consensus_svs"))
-matrix_consensus.write_parquet(matrix_outdir / f"platforms.seqc_consensus_validated.matrix.parquet",  compression="snappy")
+matrix_consensus.write_parquet(
+	matrix_outdir / "platforms.seqc_consensus_validated.matrix.parquet", compression="snappy"
+)
 
-
+## Optional: same rule, one column per caller file, from the same merge
+# matrix_file = svcf2matrix(svcf_path, manifest_path, level="file")
+# matrix_file.write_parquet(matrix_outdir / "files.matrix.parquet", compression="snappy")
