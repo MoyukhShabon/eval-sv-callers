@@ -159,9 +159,25 @@ illegal_sv_types = pl.DataFrame(
 
 illegal_sv_types.write_csv("illegal_svtypes.summary.all.tsv", separator="\t")
 
+
+# %%
+## Run OctopuSV correct on seqc2 SVs
+seqc2_svs = [
+	DATA_ROOT / "SEQC2_Consensus_SVs.vcf",
+	DATA_ROOT / "SEQC2_Validated_SVs.vcf",
+	DATA_ROOT / "SEQC2_PCR_SVs.vcf"
+]
+
+seqc2_svcfs = []
+for seqc2_vcf in seqc2_svs:
+	outpath = seqc2_vcf.with_suffix(".svcf")
+	run(["octopusv", "correct", "-i", str(seqc2_vcf), "-o", str(outpath)])
+	seqc2_svcfs.append(outpath)
+
+
 # %%
 ## Merge vcfs within platforms
-outdir_subplatform = PROJECT_ROOT / "data" / dataset / "sub-platform_merge"
+outdir_subplatform = PROJECT_ROOT / "data" / dataset / "intra-platform_merge"
 outdir_subplatform.mkdir(parents=True, exist_ok=True)
 
 for (platform,), group_df in annot.group_by("platform"):
@@ -175,23 +191,23 @@ for (platform,), group_df in annot.group_by("platform"):
 	## Merge all SVs i.e PASS & non-PASS
 	group_files_all = [DATA_ROOT / "octopusv_correct_all" / filename.replace(".vcf.gz", ".svcf") for filename in group_df["filename"]]
 	outpath_all = outdir_subplatform / f"{platform}.merged.all.svcf"
-	run(["octopusv", "merge", "-i", *map(str, group_files_all), "-o", str(outpath_all), "--union"])
+	run(["octopusv", "merge", "-i", *map(str, group_files_all), "-o", str(outpath_all), "--union", "--mode", "sample"])
 
 	## Merge PASS SVs
 	group_files_pass = [DATA_ROOT / "octopusv_correct_pass" / filename.replace(".vcf.gz", ".svcf") for filename in group_df["filename"]]
 	outpath_pass = outdir_subplatform / f"{platform}.merged.pass.svcf"
-	run(["octopusv", "merge", "-i", *map(str, group_files_pass), "-o", str(outpath_pass), "--union"])
+	run(["octopusv", "merge", "-i", *map(str, group_files_pass), "-o", str(outpath_pass), "--union", "--mode", "sample"])
 	
 
 # %%
 ## Merge all SVs from subplatform merged SVCF
-merged_paths_all = list((DATA_ROOT / "sub-platform_merge").glob("*.all.svcf"))
+merged_paths_all = list((DATA_ROOT / "intra-platform_merge").glob("*.all.svcf")) + seqc2_svcfs
 outpath_merged_all = DATA_ROOT / f"platforms.merged.all.svcf"
 run(["octopusv", "merge", "-i", *map(str, merged_paths_all), "-o", str(outpath_merged_all), "--union"])
 
 # %%
 ## Merge PASS SVs from subplatform merged SVCF
-merged_paths_pass = list((DATA_ROOT / "sub-platform_merge").glob("*.pass.svcf"))
+merged_paths_pass = list((DATA_ROOT / "intra-platform_merge").glob("*.pass.svcf")) + seqc2_svcfs
 outpath_merged_pass = DATA_ROOT / f"platforms.merged.pass.svcf"
 run(["octopusv", "merge", "-i", *map(str, merged_paths_pass), "-o", str(outpath_merged_pass), "--union"])
 
